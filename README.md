@@ -1,1 +1,1 @@
-# Proyecto-Integrador---Ingenier-a-Biom-dica
+# Proyecto-Integrador---Ingeniería-Biomédica
