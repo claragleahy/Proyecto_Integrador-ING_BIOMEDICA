@@ -1,1 +1,135 @@
+#ifndef SOS_IIR_FILTER_H
+#define SOS_IIR_FILTER_H
 
+#include <stdint.h>
+#include <string.h>
+
+struct SOS_Coefficients {
+    float b1;
+    float b2;
+    float a1;
+    float a2;
+};
+
+struct SOS_Delay_State {
+    float w0 = 0;
+    float w1 = 0;
+};
+
+// -----------------------------------------------------------------------------
+// Implementación C++ pura (sin asm) – compatible con ESP32, ESP32-C3, ESP32-S3
+// -----------------------------------------------------------------------------
+inline void sos_filter_f32_cpp(float *input, float *output, int len,
+                               const SOS_Coefficients &c, SOS_Delay_State &w)
+{
+    float w0 = w.w0;
+    float w1 = w.w1;
+
+    for (int i = 0; i < len; i++) {
+        float x = input[i];
+
+        // ec. diferencia directa II
+        float wn = x + c.a1 * w0 + c.a2 * w1;
+        float y  = wn + c.b1 * w0 + c.b2 * w1;
+
+        output[i] = y;
+
+        w1 = w0;
+        w0 = wn;
+    }
+
+    w.w0 = w0;
+    w.w1 = w1;
+}
+
+inline float sos_filter_sum_sqr_f32_cpp(float *input, float *output, int len,
+                                        const SOS_Coefficients &c, SOS_Delay_State &w,
+                                        float gain)
+{
+    float w0 = w.w0;
+    float w1 = w.w1;
+
+    float sumsq = 0;
+
+    for (int i = 0; i < len; i++) {
+        float x = input[i];
+
+        float wn = x + c.a1 * w0 + c.a2 * w1;
+        float y  = (wn + c.b1 * w0 + c.b2 * w1) * gain;
+
+        output[i] = y;
+
+        w1 = w0;
+        w0 = wn;
+
+        sumsq += y * y;
+    }
+
+    w.w0 = w0;
+    w.w1 = w1;
+
+    return sumsq;
+}
+
+// -----------------------------------------------------------------------------
+// Clase C++ igual a la original, pero usando las funciones en C++ puro
+// -----------------------------------------------------------------------------
+struct SOS_IIR_Filter {
+
+    const int num_sos;
+    const float gain;
+    SOS_Coefficients* sos = NULL;
+    SOS_Delay_State* w = NULL;
+
+    SOS_IIR_Filter(size_t num_sos, const float gain,
+                   const SOS_Coefficients _sos[] = NULL)
+        : num_sos(num_sos), gain(gain)
+    {
+        if (num_sos > 0) {
+            sos = new SOS_Coefficients[num_sos];
+            if (sos && _sos) memcpy(sos, _sos, num_sos * sizeof(SOS_Coefficients));
+            w = new SOS_Delay_State[num_sos]();
+        }
+    }
+
+    template <size_t Array_Size>
+    SOS_IIR_Filter(const float gain, const SOS_Coefficients (&_sos)[Array_Size])
+        : SOS_IIR_Filter(Array_Size, gain, _sos) {}
+
+    float filter(float* input, float* output, size_t len) {
+        if (num_sos < 1 || sos == NULL || w == NULL) return 0;
+
+        float* src = input;
+
+        for (int i = 0; i < num_sos - 1; i++) {
+            sos_filter_f32_cpp(src, output, len, sos[i], w[i]);
+            src = output;
+        }
+
+        return sos_filter_sum_sqr_f32_cpp(src, output, len,
+                                          sos[num_sos - 1],
+                                          w[num_sos - 1],
+                                          gain);
+    }
+
+    ~SOS_IIR_Filter() {
+        delete[] w;
+        delete[] sos;
+    }
+};
+
+struct No_IIR_Filter {
+    const int num_sos = 0;
+    const float gain = 1.0;
+
+    float filter(float* input, float* output, size_t len) {
+        float sum = 0;
+        for (size_t i = 0; i < len; i++) {
+            sum += input[i] * input[i];
+            output[i] = input[i];
+        }
+        return sum;
+    }
+};
+
+#endif // SOS_IIR_FILTER_H
