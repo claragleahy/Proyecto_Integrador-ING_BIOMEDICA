@@ -1,1 +1,687 @@
-código servidor
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include "esp_wifi.h"
+#include "RTClib.h"
+#include <SD.h>
+#include <SPI.h>
+#include "sos-iir-filter.h"
+#include <Adafruit_NeoPixel.h>
+
+void crearArchivo();
+double convertir_a_decibelios(double RMS);
+void recibirDato(const uint8_t * mac, const uint8_t *incomingData, int len);
+void escribirDato(double m1, double m2, double m3);
+void checkRecepcion(const wifi_tx_info_t *info, esp_now_send_status_t status);
+void mostrarAlerta();
+
+double DatoMic1 = 0;
+double DatoMic2 = 0;
+double DatoMic3 = 0;
+
+bool mic1_activo = true;
+bool clienteM2_activo = false;  // true si M2 está conectado y enviando datos
+bool clienteM3_activo = false;  // true si M3 está conectado y enviando datos
+
+volatile bool recibidoM2 = false;
+volatile bool recibidoM3 = false;
+
+volatile bool triggerM2_enviado = false;
+volatile bool triggerM3_enviado = false;
+
+volatile bool triggerM2_recibido = false;
+volatile bool triggerM3_recibido = false;
+
+bool alertaRojo = 0;
+uint8_t contadorRojo = 0;
+unsigned long rojoMostrado = 0;
+
+typedef struct __attribute__((packed)) {
+  char id[3];     // "M2" o "M3"
+  float valor;    // nivel en dB
+} mensaje_cliente;
+
+typedef struct __attribute__((packed)) {
+  uint8_t comando;   // 1 = pedir muestra
+} mensaje_trigger;
+
+uint8_t mac_M2[] = {0xAC, 0xA7, 0x04, 0xC0, 0x52, 0x4C};
+uint8_t mac_M3[] = {0xAC, 0xA7, 0x04, 0xB8, 0x5D, 0x6C};
+
+unsigned long ultimaRecepcion_M2 = 0;
+unsigned long ultimaRecepcion_M3 = 0;
+
+static unsigned long ultimoFlush = 0;
+
+// ==== Pines para LEDS ====
+#define LED1_PIN  16
+#define LED2_PIN  17
+
+// ==== Pines I2S para INMP441 ====
+#define I2S_WS   25   // LRCL / WS
+#define I2S_SD   32   // DOUT
+#define I2S_SCK  27   // BCLK
+
+#define I2S_PORT I2S_NUM_0
+#define SAMPLE_RATE 48000 // compatible con filtros IIR
+
+// ==== Pines SD ====
+#define SD_CS   5
+#define SD_MOSI 23
+#define SD_MISO 19
+#define SD_SCK  18
+
+// ==== RTC DS1307 ====
+RTC_DS1307 rtc;
+
+// Cada tira tiene 1 LED
+#define NUM_LEDS_M 1
+
+// Objetos NeoPixel para cada LED
+Adafruit_NeoPixel led1(NUM_LEDS_M, LED1_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel led2(NUM_LEDS_M, LED2_PIN, NEO_GRB + NEO_KHZ800);
+
+// ==== Pines Alerta ====
+#define LED_PIN   26
+#define NUM_LEDS_A  23
+
+// Objeto NeoPixel para la alerta
+Adafruit_NeoPixel alerta(NUM_LEDS_A, LED_PIN, NEO_RGB + NEO_KHZ400);
+
+// ===== SD + RTC manejo de archivos =====
+File dataFile;
+
+int diaActual = -1;
+int mesActual = -1;
+int anioActual = -1;
+
+char nombreArchivo[40];
+
+// __________FILTROS IIR____________________________________________________________________________
+
+// 1. Filtro DC_BLOCKER, filtro pasa-altos muy suave para eliminar el componente DC (offset)
+SOS_IIR_Filter DC_BLOCKER(
+  1.0,
+  (SOS_Coefficients[1]){
+    {-1.0, 0.0, 0.9992, 0}
+  }
+);
+
+// 2. Filtro ecualizador del micrófono INMP441
+SOS_IIR_Filter INMP441(
+  1.00197834654696,
+  (SOS_Coefficients[1]){
+    {-1.986920458344451, 0.986963226946616, 1.995178510504166, -0.995184322194091}
+  }
+);
+
+// 3. Filtro de Ponderación A
+SOS_IIR_Filter A_weighting(
+  0.169994948147430,
+  (SOS_Coefficients[3]){
+    {-2.00026996133106, 1.00027056142719, -1.060868438509278, -0.163987445885926},
+    {4.35912384203144, 3.09120265783884, 1.208419926363593, -0.273166998428332},
+    {-0.70930303489759, -0.29071868393580, 1.982242159753048, -0.982298594928989}
+  }
+);
+
+double nivel_dB = 0;
+double RMS = 0;
+double promCuadrados = 0;
+unsigned long inicioPeriodo;
+uint8_t bloque = 0;
+float sumCuadrados_porBloque;
+uint64_t sumCuadrados = 0;
+uint16_t total_muestras = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  led1.begin();
+  led2.begin();
+  led1.setBrightness(5);
+  led2.setBrightness(5);
+  led1.setPixelColor(0, led1.Color(255, 0, 0)); // empieza en rojo
+  led2.setPixelColor(0, led2.Color(255, 0, 0)); // empieza en rojo
+  led1.show();
+  led2.show();
+
+  alerta.begin();
+  alerta.setBrightness(40);
+  alerta.clear();
+  alerta.show();
+  delay(50);
+  
+    // ===== Inicializar RTC =====
+  Wire.begin(21, 22);
+  Wire.setClock(100000);  // 100 kHz obligatorio para DS1307
+
+  if (!rtc.begin()) {
+    Serial.println("No se encuentra el DS1307. Verificar conexiones.");
+  } else Serial.println("RTC detectado correctamente.");
+
+  // ===== Inicializar SD =====
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS)) {
+    Serial.println("Error inicializando tarjeta SD");
+    //while(true);
+  }
+
+  crearArchivo();
+
+  // ===== Inicializar ESP-NOW =====
+  WiFi.mode(WIFI_STA);        // obligatorio para ESP-NOW
+  WiFi.disconnect();          // asegura que no quede conectado a nada
+  delay(100);
+
+  Serial.print("MAC servidor: ");
+  Serial.println(WiFi.macAddress());
+
+  esp_wifi_set_ps(WIFI_PS_NONE);               // desactivar power save
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); // fijar canal 1
+  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B);
+  esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_1M_L); // tasa ESP-NOW
+  esp_wifi_set_max_tx_power(78);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error inicializando ESP-NOW");
+    return;
+  } else {
+    Serial.println("ESP-NOW inicializado correctamente");
+  }
+  esp_wifi_set_max_tx_power(78);
+
+  esp_now_register_recv_cb(recibirDato);
+  esp_now_register_send_cb(checkRecepcion);
+
+  // ===== Configuración I2S =====
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // L/R a GND
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = 128,
+    .use_apll = false
+  };
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+  if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) != ESP_OK) {
+    Serial.println("Error inicializando I2S");
+    //while (true);
+  }
+  if (i2s_set_pin(I2S_PORT, &pin_config) != ESP_OK) {
+    Serial.println("Error asignando pines I2S");
+    //while (true);
+  }
+
+  // ===== Registrar peers ESP-NOW correctamente =====
+  esp_now_peer_info_t peerInfoM2 = {};
+  peerInfoM2.channel = 1;
+  peerInfoM2.encrypt = false;
+  memcpy(peerInfoM2.peer_addr, mac_M2, 6);
+  esp_err_t addStatusM2 = esp_now_add_peer(&peerInfoM2);
+  Serial.print("Agregando peer M2... ");
+  Serial.println(addStatusM2 == ESP_OK ? "OK" : "ERROR");
+
+  esp_now_peer_info_t peerInfoM3 = {};
+  peerInfoM3.channel = 1;
+  peerInfoM3.encrypt = false;
+  memcpy(peerInfoM3.peer_addr, mac_M3, 6);
+  esp_err_t addStatusM3 = esp_now_add_peer(&peerInfoM3);
+  Serial.print("Agregando peer M3... ");
+  Serial.println(addStatusM3 == ESP_OK ? "OK" : "ERROR");
+
+  uint8_t primaryChan;
+  wifi_second_chan_t secondChan;
+
+  esp_wifi_get_channel(&primaryChan, &secondChan);
+
+  Serial.print("Canal actual: ");
+  Serial.println(primaryChan);
+
+  int8_t tx_power;
+  esp_wifi_get_max_tx_power(&tx_power);
+  Serial.print("TX Power: ");
+  Serial.println(tx_power);
+
+  Serial.println("ESP-NOW listo. Esperando datos...");
+
+  Serial.println("INMP441 inicializado. Midiendo...");
+
+  inicioPeriodo = millis();
+  //alarmaMostrada = millis();
+}
+
+void loop() {
+
+  crearArchivo();
+
+  int32_t buffer[250];
+  float sample[250];
+  float  sample_f[250];
+
+  size_t bytes_read;
+  unsigned long tAudio0 = micros();
+  if (i2s_read(I2S_PORT, buffer, sizeof(buffer), &bytes_read, 10) == ESP_OK && bytes_read > 0) {
+
+    int samples_read = bytes_read / 4; //muestras de 32 bits
+    for (int i = 0; i < samples_read; i++) {
+      sample[i] = buffer[i] >> 8; //saco las 8 menos significativas
+    }
+
+    //__________________________________APLICO LOS FILTROS:__________________________________
+    // 1. DC BLOCKER
+    DC_BLOCKER.filter(sample, sample_f, samples_read);
+    // 2. EQ INMP441
+    INMP441.filter(sample_f, sample_f, samples_read);
+    // 3. A-weighting
+    sumCuadrados_porBloque = A_weighting.filter(sample_f, sample_f, samples_read);
+    //_______________________________________________________________________________________
+
+    sumCuadrados += sumCuadrados_porBloque; 
+    total_muestras += samples_read;
+    bloque++;
+    unsigned long tAudio1 = micros();
+    //Serial.print("Tiempo audio us: ");
+    //Serial.println(tAudio1 - tAudio0);
+  }
+
+  if (bloque == 24) {
+    if (total_muestras > 0) {
+      // Media de los cuadrados (Mean)
+      promCuadrados = (double)sumCuadrados / total_muestras; 
+  
+      // Raíz cuadrada (Root) -> Este es el valor RMS en unidades digitales (sin escala)
+      RMS = sqrt(promCuadrados);
+
+      if (RMS < 20) {   // si el RMS es muy chico → ruido → mic desconectado
+        mic1_activo = false;
+      } else {
+        mic1_activo = true;
+      }
+
+      // 4. CONVERSIÓN A DECIBELIOS (función)
+      nivel_dB = convertir_a_decibelios(RMS); 
+    }
+
+    if (nivel_dB > DatoMic1) {
+      DatoMic1 = nivel_dB;
+    }
+
+    bloque = 0;
+    sumCuadrados = 0;
+    total_muestras = 0;
+  }
+
+if (millis() - inicioPeriodo >= 500) {
+
+  //unsigned long t0 = millis();
+
+  // Reset flags
+  recibidoM2 = false;
+  recibidoM3 = false;
+
+  // Mandar trigger
+  mensaje_trigger trigger;
+  trigger.comando = 1;
+
+  triggerM2_enviado = false;
+  triggerM3_enviado = false;
+
+  triggerM2_recibido = false;
+  triggerM3_recibido = false;
+
+  esp_err_t sendM2 = esp_now_send(mac_M2, (uint8_t*)&trigger, sizeof(trigger));
+  esp_err_t sendM3 = esp_now_send(mac_M3, (uint8_t*)&trigger, sizeof(trigger));
+
+  unsigned long tAck = millis();
+  while (millis() - tAck < 50) {
+    if (triggerM2_enviado && triggerM3_enviado) break;
+    yield();
+  }
+
+  Serial.print("Send M2: ");
+  Serial.println(sendM2 == ESP_OK ? "OK" : "ERROR");
+
+  if (!triggerM2_enviado) {
+    Serial.println("ACK M2: NO RESPONDE");
+  }
+  else if (triggerM2_recibido) {
+    Serial.println("ACK M2: ENTREGADO");
+  }
+  else {
+    Serial.println("ACK M2: FALLÓ");
+  }
+
+  Serial.print("Send M3: ");
+  Serial.println(sendM3 == ESP_OK ? "OK" : "ERROR");
+
+  if (!triggerM3_enviado) {
+    Serial.println("ACK M3: NO RESPONDE");
+  }
+  else if (triggerM3_recibido) {
+    Serial.println("ACK M3: ENTREGADO");
+  }
+  else {
+    Serial.println("ACK M3: FALLÓ");
+  }
+
+  // ESPERAR RESPUESTAS (máx 200 ms)
+  leerDato();
+
+  // Ahora sí escribir
+  escribirDato(DatoMic1, DatoMic2, DatoMic3);
+
+  //if (millis() - alarmaMostrada >= 2000) {
+    mostrarAlerta();
+    if (alertaRojo) {
+      alerta.setPixelColor(0, alerta.Color(255, 0, 0));
+      if (millis() - rojoMostrado >= 5000) {
+        alerta.setPixelColor(0, alerta.Color(0, 0, 0));
+        contadorRojo = 0;
+        alertaRojo = 0;
+      }
+      alerta.show();
+    }
+  //}
+
+  // Reset valores
+  DatoMic1 = 0;
+  DatoMic2 = 0;
+  DatoMic3 = 0;
+
+  inicioPeriodo = millis();
+}
+
+  const unsigned long TIEMPO_INACTIVO = 3000;
+
+  clienteM2_activo = (millis() - ultimaRecepcion_M2 < TIEMPO_INACTIVO); 
+  clienteM3_activo = (millis() - ultimaRecepcion_M3 < TIEMPO_INACTIVO);
+
+  static bool lastM2 = false;
+  static bool lastM3 = false;
+
+  // === LED M2 ===
+  if (clienteM2_activo != lastM2) {
+
+    if (clienteM2_activo) {
+      led1.setPixelColor(0, led1.Color(0, 255, 0));
+      Serial.println("M2 activo");
+    } else {
+      led1.setPixelColor(0, led1.Color(255, 0, 0));
+      Serial.println("M2 inactivo");
+    }
+
+    led1.show();
+    lastM2 = clienteM2_activo;
+  }
+
+  // === LED M3 ===
+  if (clienteM3_activo != lastM3) {
+
+    if (clienteM3_activo) {
+      led2.setPixelColor(0, led2.Color(0, 255, 0));
+      Serial.println("M3 activo");
+    } else {
+      led2.setPixelColor(0, led2.Color(255, 0, 0));
+      Serial.println("M3 inactivo");
+    }
+
+    led2.show();
+    lastM3 = clienteM3_activo;
+  }
+
+  yield();
+}
+
+// Función para convertir a dB:
+double convertir_a_decibelios(double RMS) {
+
+  float SENSIBILIDAD = -26.0;  // dBFS para 94 dB SPL (1 pascal)
+  float REFERENCIA_dB = 94.0;  // referencia segun datasheet
+  float OFFSET_dB = 2.57;      // valor de la calibracion en el laboratorio CINTRA
+  int ADC_BITS = 24;           // I2S del INMP441 (cantidad de bits del ADC del mic)
+
+  float AMPLITUD_REF = pow(10.0, SENSIBILIDAD / 20.0) * ((1 << (ADC_BITS - 1)) - 1); // valor del adc que da cuando mido 94 dB ()
+
+  float VALOR_dB = REFERENCIA_dB + OFFSET_dB + 20.0 * log10(RMS / AMPLITUD_REF); // valor final en dB de la medicion
+
+  return VALOR_dB;
+}
+
+void leerDato() {
+
+  unsigned long inicioEspera = millis();
+  const unsigned long TIMEOUT_TOTAL = 200;   // máximo 200 ms
+
+  while (millis() - inicioEspera < TIMEOUT_TOTAL) {
+
+    if (recibidoM2 && recibidoM3) {
+      return;   // ya llegaron ambos
+    }
+
+    yield();   // pequeña cesión de CPU
+  }
+  // Si sale por timeout, simplemente continúa el loop
+}
+
+void recibirDato(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+
+  Serial.print("Paquete recibido de MAC: ");
+  for (int i = 0; i < 6; i++) {
+    Serial.print(info->src_addr[i], HEX);
+    if (i < 5) Serial.print(":");
+  }
+  Serial.print(" | Longitud: ");
+  Serial.println(len);
+
+  if (len != sizeof(mensaje_cliente)) {
+    Serial.println("Longitud incorrecta");
+    return;
+  }
+
+  mensaje_cliente msg;
+  memcpy(&msg, incomingData, sizeof(msg));
+
+  msg.id[2] = '\0';
+
+  Serial.print("ID recibido: ");
+  Serial.println(msg.id);
+
+  if (strcmp(msg.id, "M2") == 0) {
+    Serial.println("→ Es M2");
+    DatoMic2 = msg.valor;
+    ultimaRecepcion_M2 = millis();
+    recibidoM2 = true;
+  }
+  else if (strcmp(msg.id, "M3") == 0) {
+    Serial.println("→ Es M3");
+    DatoMic3 = msg.valor;
+    ultimaRecepcion_M3 = millis();
+    recibidoM3 = true;
+  }
+  else {
+    Serial.println("ID desconocido");
+  }
+}
+
+void checkRecepcion(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+
+  const uint8_t *mac_addr = info->des_addr;
+
+  if (memcmp(mac_addr, mac_M2, 6) == 0) {
+    triggerM2_enviado = true;
+    triggerM2_recibido = (status == ESP_NOW_SEND_SUCCESS);
+  }
+
+  if (memcmp(mac_addr, mac_M3, 6) == 0) {
+    triggerM3_enviado = true;
+    triggerM3_recibido = (status == ESP_NOW_SEND_SUCCESS);
+  }
+}
+
+void crearArchivo() {
+
+  DateTime now = rtc.now();
+
+  // ¿Es la primera vez o cambió el día?
+  if (now.day() != diaActual || now.month() != mesActual || now.year() != anioActual) {
+
+    // Cerrar archivo anterior si estaba abierto
+    if (dataFile) {
+      dataFile.close();
+    }
+
+    // Guardar nueva fecha
+    diaActual  = now.day();
+    mesActual  = now.month();
+    anioActual = now.year();
+
+    // Nombre: dd-mm-yyyy_hh-mm-ss.csv
+    sprintf(nombreArchivo,
+            "/%02d-%02d-%04d_%02d-%02d-%02d.csv",
+            now.day(), now.month(), now.year(),
+            now.hour(), now.minute(), now.second());
+
+    Serial.print("Creando archivo: ");
+    Serial.println(nombreArchivo);
+
+    dataFile = SD.open(nombreArchivo, FILE_WRITE);
+
+    if (!dataFile) {
+      Serial.println("ERROR: No se pudo crear el archivo");
+      return;
+    }
+
+    // Escribir encabezado CSV
+    dataFile.println("Hora;DatoMic1;DatoMic2;DatoMic3");
+    dataFile.flush();
+  }
+}
+
+void escribirDato(double m1, double m2, double m3) {
+
+  if (!dataFile) return;
+  DateTime now = rtc.now();
+  char linea[120];
+
+  // Buffers temporales para cada columna
+  char mic1_str[20];
+  char mic2_str[20];
+  char mic3_str[20];
+
+  // === Micrófono 1 ===
+  if (!mic1_activo) {
+    strcpy(mic1_str, "N/A");
+  } else {
+    sprintf(mic1_str, "%.2f", m1);
+  }
+
+  // === Micrófono 2 ===
+  if (m2 != 0) {
+    sprintf(mic2_str, "%.2f", m2);
+  } else {
+    strcpy(mic2_str, "N/A");
+  }
+
+  // === Micrófono 3 ===
+  if (m3 != 0) {
+    sprintf(mic3_str, "%.2f", m3);
+  } else {
+    strcpy(mic3_str, "N/A");
+  }
+
+  // Línea CSV final
+sprintf(linea,
+        "%02d:%02d:%02d;%s;%s;%s",
+        now.hour(), now.minute(), now.second(),
+        mic1_str, mic2_str, mic3_str);
+
+  Serial.print("Fecha: ");
+  Serial.print(now.day());
+  Serial.print("/");
+  Serial.println(now.month());
+
+  Serial.print("Hora: ");
+  Serial.print(now.hour());
+  Serial.print(":");
+  Serial.print(now.minute());
+  Serial.print(":");
+  Serial.println(now.second());
+
+  Serial.print("Datos: ");
+  Serial.print(mic1_str);
+  Serial.print(", ");
+  Serial.print(mic2_str);
+  Serial.print(", ");
+  Serial.println(mic3_str);
+
+  dataFile.println(linea);
+
+  if (millis() - ultimoFlush > 5000) {
+    dataFile.flush();
+    ultimoFlush = millis();
+  }
+}
+
+void mostrarAlerta() {
+
+  alerta.clear();
+
+  // Calcular promedio ignorando los ceros
+  float suma = 0;
+  int n = 0;
+
+  if (DatoMic1 != 0) { suma += DatoMic1; n++; }
+  if (DatoMic2 != 0) { suma += DatoMic2; n++; }
+  if (DatoMic3 != 0) { suma += DatoMic3; n++; }
+
+  // Si no hay datos válidos, no mostrar alerta
+  if (n == 0) {
+    alerta.show();
+    return;
+  }
+
+  float promedio = suma / n;
+
+  if (promedio > 65) {
+
+    for (int i = 1; i < 23; i++)
+      alerta.setPixelColor(i, alerta.Color(255, 0, 0));
+
+    contadorRojo++;
+    if (contadorRojo == 4) {
+      alertaRojo = 1;
+      rojoMostrado = millis();
+    }
+
+  } else if (promedio > 58) {
+
+    for (int i = 1; i < 15; i++)
+      alerta.setPixelColor(i, alerta.Color(200, 20, 0));
+    contadorRojo = 0;
+
+  } else if (promedio > 54) {
+
+    for (int i = 1; i < 9; i++)
+      alerta.setPixelColor(i, alerta.Color(140, 130, 0));
+    contadorRojo = 0;
+
+  } else {
+
+    for (int i = 1; i < 4; i++)
+      alerta.setPixelColor(i, alerta.Color(0, 255, 0));
+    contadorRojo = 0;
+  }
+
+  alerta.show();
+}
