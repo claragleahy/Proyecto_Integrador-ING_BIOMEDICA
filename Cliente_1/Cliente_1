@@ -1,1 +1,258 @@
-codigo Cliente 1
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <WiFi.h>
+#include "esp_wifi.h"
+#include "esp_now.h"
+#include "IIRFilter.h"
+
+double convertir_a_decibelios(double RMS);
+void recibirTrigger(const uint8_t *mac, const uint8_t *incomingData, int len);
+void enviarDato(const wifi_tx_info_t *info, esp_now_send_status_t status);
+
+// ==== Pines I2S para INMP441 ====
+#define I2S_WS   20   // LRCL / WS
+#define I2S_SD   10   // DOUT
+#define I2S_SCK  21   // BCLK
+
+#define I2S_PORT I2S_NUM_0
+#define SAMPLE_RATE 48000
+
+const char clientID[] = "M2"; // Identificador del cliente
+
+uint8_t mac_maestro[] = {0xF0, 0x24, 0xF9, 0x0C, 0x4C, 0x04}; // MAC del maestro
+
+typedef struct __attribute__((packed)) {
+  char id[3];
+  float valor;
+} mensaje_cliente;
+
+typedef struct __attribute__((packed)) {
+  uint8_t comando;
+} mensaje_trigger;
+
+// __________FILTROS IIR____________________________________________________________________________
+
+// 1. Filtro DC_BLOCKER, filtro pasa-altos muy suave para eliminar el componente DC (offset)
+SOS_IIR_Filter DC_BLOCKER(
+  1.0,
+  (SOS_Coefficients[1]){
+    {-1.0, 0.0, 0.9992, 0}
+  }
+);
+
+// 2. Filtro ecualizador del micrófono INMP441
+SOS_IIR_Filter INMP441(
+  1.00197834654696,
+  (SOS_Coefficients[1]){
+    {-1.986920458344451, 0.986963226946616, 1.995178510504166, -0.995184322194091}
+  }
+);
+
+// 3. Filtro de Ponderación A
+SOS_IIR_Filter A_weighting(
+  0.169994948147430,
+  (SOS_Coefficients[3]){
+    {-2.00026996133106, 1.00027056142719, -1.060868438509278, -0.163987445885926},
+    {4.35912384203144, 3.09120265783884, 1.208419926363593, -0.273166998428332},
+    {-0.70930303489759, -0.29071868393580, 1.982242159753048, -0.982298594928989}
+  }
+);
+
+double DatoMic2 = 0;
+double nivel_dB = 0;
+double RMS = 0;
+double promCuadrados = 0;
+unsigned long inicioPeriodo;
+uint8_t bloque = 0;
+float sumCuadrados_porBloque = 0;
+uint64_t sumCuadrados = 0;
+uint16_t total_muestras = 0;
+
+const unsigned long TIMEOUT_RESET = 15000;
+volatile bool senalRecibida = false;
+unsigned long ultimaSeñalRecibida = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();  // no conectarse a ningún AP
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+  delay(100);
+
+  Serial.print("MAC cliente 1: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error inicializando ESP-NOW");
+    while(true);
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac_maestro, 6);
+  peerInfo.channel = 1;  // mismo canal que el maestro
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Error agregando peer maestro");
+    while(true);
+  }
+
+  esp_now_register_recv_cb(recibirTrigger);
+  esp_now_register_send_cb(enviarDato);
+
+  // ===== Configuración I2S =====
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // L/R a GND
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = 128,
+    .use_apll = false
+  };
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+  if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) != ESP_OK) {
+    Serial.println("Error inicializando I2S");
+    while (true);
+  }
+  if (i2s_set_pin(I2S_PORT, &pin_config) != ESP_OK) {
+    Serial.println("Error asignando pines I2S");
+    while (true);
+  }
+  Serial.println("INMP441 inicializado. Midiendo...");
+
+  inicioPeriodo = millis();
+  ultimaSeñalRecibida = millis();
+}
+
+void loop() {
+
+  unsigned long tiempoSinSeñal = millis() - ultimaSeñalRecibida;
+
+  // === Timeout: reset extremo ===
+  if (tiempoSinSeñal > TIMEOUT_RESET) {
+    Serial.println("Timeout 8.5s → reinicio forzado");
+
+    ESP.restart();
+  }
+
+  if (senalRecibida) {
+    mensaje_cliente m;
+    strncpy(m.id, clientID, sizeof(m.id));
+    m.id[sizeof(m.id)-1] = '\0'; // asegurar terminación nula;
+    m.valor = DatoMic2;
+
+    esp_err_t status = esp_now_send(mac_maestro, (uint8_t*)&m, sizeof(m));
+    if(status == ESP_OK){
+        Serial.print("Dato enviado: ");
+        Serial.println(DatoMic2);
+    } else {
+        Serial.println("Error enviando dato por ESP-NOW");
+    }
+
+    // Reset
+    DatoMic2 = 0;
+    senalRecibida = false;
+  }
+
+
+  int32_t buffer[250];
+  float sample[250];
+  float  sample_f[250];
+
+  size_t bytes_read;
+
+  //if (!medicionLista) {  
+    if (i2s_read(I2S_PORT, buffer, sizeof(buffer), &bytes_read, 10) == ESP_OK && bytes_read > 0) {
+
+      int samples_read = bytes_read / 4;
+      for (int i = 0; i < samples_read; i++) {
+        sample[i] = buffer[i] >> 8; //saco las 8 menos significativas
+        //int32_t absSample = abs(sample);
+      }
+
+      //__________________________________APLICO LOS FILTROS:__________________________________
+      // 1. DC BLOCKER
+      DC_BLOCKER.filter(sample, sample_f, samples_read);
+      // 2. EQ INMP441
+      INMP441.filter(sample_f, sample_f, samples_read);
+      // 3. A-weighting
+      sumCuadrados_porBloque = A_weighting.filter(sample_f, sample_f, samples_read);
+      //_______________________________________________________________________________________
+
+      sumCuadrados += sumCuadrados_porBloque; 
+      total_muestras+= samples_read;
+    
+      bloque++;
+    }
+    
+    if (bloque == 24) {
+      if (total_muestras > 0) {
+        // Media de los cuadrados (Mean)
+        promCuadrados = (double)sumCuadrados / total_muestras; 
+    
+        // Raíz cuadrada (Root) -> Este es el valor RMS en unidades digitales (sin escala)
+        RMS = sqrt(promCuadrados);
+
+        // 4. CONVERSIÓN A DECIBELIOS (función)
+        nivel_dB = convertir_a_decibelios(RMS); 
+      }
+      if (nivel_dB > DatoMic2) {
+        DatoMic2 = nivel_dB;
+      }
+
+      bloque = 0;
+      sumCuadrados = 0;
+      total_muestras = 0;
+    }
+  yield();
+
+}
+
+// Función para convertir a dB:
+double convertir_a_decibelios(double RMS) {
+
+  float SENSIBILIDAD = -26.0;  // dBFS para 94 dB SPL (1 pascal)
+  float REFERENCIA_dB = 94.0;  // referencia segun datasheet
+  float OFFSET_dB = 1.97;      // valor de la calibracion en el laboratorio CINTRA
+  int ADC_BITS = 24;           // I2S del INMP441 (cantidad de bits del ADC del mic)
+
+  float AMPLITUD_REF = pow(10.0, SENSIBILIDAD / 20.0) * ((1 << (ADC_BITS - 1)) - 1); // valor del adc que da cuando mido 94 dB ()
+
+  float VALOR_dB = REFERENCIA_dB + OFFSET_dB + 20.0 * log10(RMS / AMPLITUD_REF); // valor final en dB de la medicion
+
+  return VALOR_dB;
+}
+
+void recibirTrigger(const esp_now_recv_info_t *info,
+                    const uint8_t *incomingData,
+                    int len) {
+
+  if (len != sizeof(mensaje_trigger)) return;
+
+  mensaje_trigger msg;
+  memcpy(&msg, incomingData, sizeof(msg));
+
+  if (msg.comando == 1) {
+      senalRecibida = true;
+      ultimaSeñalRecibida = millis();
+  }
+}
+
+
+  void enviarDato(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        Serial.println("Dato enviado correctamente");
+    } else {
+        Serial.println("Error enviando dato");
+    }
+  }
